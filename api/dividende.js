@@ -1,3 +1,5 @@
+const cache = {};
+
 export default async function handler(req, res) {
   const { ticker } = req.query;
   const key = process.env.FINNHUB_API_KEY;
@@ -7,6 +9,12 @@ export default async function handler(req, res) {
   }
   if (!ticker) {
     return res.status(400).json({ error: "Paramètre ticker manquant" });
+  }
+
+  const cached = cache[ticker];
+  const now = Date.now();
+  if (cached && now - cached.timestamp < 60 * 60 * 1000) {
+    return res.status(200).json({ ...cached.data, cached: true });
   }
 
   try {
@@ -19,9 +27,8 @@ export default async function handler(req, res) {
       return res.status(404).json({ error: "Aucun dividende trouvé" });
     }
 
-    // On prend le dividende le plus récent
     const latest = data[0];
-    res.status(200).json({
+    const result = {
       ticker,
       amount: latest.amount,
       exDate: latest.exDate,
@@ -29,7 +36,11 @@ export default async function handler(req, res) {
       currency: latest.currency,
       source: "Finnhub",
       fetchedAt: new Date().toISOString(),
-    });
+    };
+
+    cache[ticker] = { data: result, timestamp: now };
+
+    res.status(200).json(result);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
