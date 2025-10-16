@@ -1,85 +1,139 @@
-// /api/dividende.js — Alpha Vantage (CommonJS) + cache 60s
+// api/dividende.js (Vercel Serverless Function)
+// Place this file in: /api/dividende.js
 
-const cache = {}; // { TICKER: { t: timestamp, data: {...} } }
+const cache = {}; // Simple in-memory cache { TICKER: { t: timestamp, data: {...} } }
 
 module.exports = async (req, res) => {
   res.setHeader('Content-Type', 'application/json; charset=utf-8');
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  
   try {
-    const key = process.env.ALPHA_VANTAGE_KEY || '';
+    const API_KEY = process.env.ALPHA_VANTAGE_KEY || '';
     const raw = (req.query && req.query.ticker) ? String(req.query.ticker) : '';
     const ticker = raw.trim().toUpperCase();
-
-    if (!key) {
+    
+    // Validation
+    if (!API_KEY) {
       res.statusCode = 500;
-      return res.end(JSON.stringify({ error: "Clé API Alpha Vantage manquante" }));
+      return res.end(JSON.stringify({ 
+        error: "Clé API Alpha Vantage manquante",
+        hint: "Ajoutez ALPHA_VANTAGE_KEY dans vos variables d'environnement Vercel"
+      }));
     }
+    
     if (!ticker) {
       res.statusCode = 400;
       return res.end(JSON.stringify({ error: "Paramètre ticker manquant" }));
     }
-
-    // Cache 60s
+    
+    // Cache 60 secondes pour éviter les rate limits
     const now = Date.now();
-    const c = cache[ticker];
-    if (c && now - c.t < 60 * 1000) {
+    const cached = cache[ticker];
+    if (cached && now - cached.t < 60 * 1000) {
       res.statusCode = 200;
-      return res.end(JSON.stringify({ ...c.data, cached: true }));
+      return res.end(JSON.stringify({ ...cached.data, cached: true }));
     }
-
-    const url = `https://www.alphavantage.co/query?function=TIME_SERIES_MONTHLY_ADJUSTED&symbol=${encodeURIComponent(ticker)}&datatype=json&apikey=${key}`;
-    const r = await fetch(url);
-    const status = r.status;
-    let j = null;
-    try { j = await r.json(); } catch { j = null; }
-
-    // Messages d’erreur Alpha Vantage (rate limit, bad key, etc.)
-    if (!j || typeof j !== 'object') {
-      res.statusCode = 502;
-      return res.end(JSON.stringify({ error: "Réponse API invalide", status }));
+    
+    // Appel API Alpha Vantage - TIME_SERIES_DAILY_ADJUSTED pour avoir les dividendes
+    const url = `https://www.alphavantage.co/query?function=TIME_SERIES_DAILY_ADJUSTED&symbol=${encodeURIComponent(ticker)}&outputsize=compact&apikey=${API_KEY}`;
+    
+    const response = await fetch(url);
+    const data = await response.json();
+    
+    // Gestion des erreurs Alpha Vantage
+    if (data['Error Message']) {
+      res.statusCode = 404;
+      return res.end(JSON.stringify({ 
+        error: "Ticker invalide ou non trouvé",
+        ticker: ticker,
+        detail: data['Error Message']
+      }));
     }
-    if (j.Note) {
-      // Rate limit atteint
+    
+    if (data['Note']) {
       res.statusCode = 429;
-      return res.end(JSON.stringify({ error: "Limite Alpha Vantage atteinte. Réessaie dans une minute.", note: j.Note }));
+      return res.end(JSON.stringify({ 
+        error: "Limite API atteinte (5 calls/min pour free tier)",
+        note: data['Note']
+      }));
     }
-    if (j['Error Message']) {
-      res.statusCode = 400;
-      return res.end(JSON.stringify({ error: "Symbole invalide ou non pris en charge", detail: j['Error Message'] }));
-    }
-
-    const series = j['Monthly Adjusted Time Series'];
-    if (!series || typeof series !== 'object') {
+    
+    // Extraction des données
+    const timeSeries = data['Time Series (Daily)'];
+    
+    if (!timeSeries) {
       res.statusCode = 404;
-      return res.end(JSON.stringify({ error: "Aucune donnée mensuelle trouvée pour ce ticker" }));
+      return res.end(JSON.stringify({ 
+        error: "Aucune donnée disponible pour ce ticker",
+        ticker: ticker
+      }));
     }
-
-    // Cherche le dernier mois où '7. dividend amount' > 0
-    const entries = Object.entries(series)
-      .map(([date, values]) => ({ date, div: parseFloat(values['7. dividend amount'] || '0') }))
-      .sort((a, b) => (a.date < b.date ? 1 : -1)); // plus récent d’abord
-
-    const last = entries.find(e => e.div > 0);
-    if (!last) {
+    
+    // Cherche le dernier dividende (non-zero)
+    const dates = Object.keys(timeSeries).sort().reverse();
+    let lastDividend = null;
+    
+    for (const date of dates) {
+      const dayData = timeSeries[date];
+      const divAmount = parseFloat(dayData['7. dividend amount']);
+      
+      if (divAmount > 0) {
+        lastDividend = {
+          ticker: ticker,
+          source: "Alpha Vantage",
+          amount: divAmount,
+          exDate: date,
+          paymentDate: estimatePaymentDate(date),
+          currency: guessCurrency(ticker),
+          fetchedAt: new Date().toISOString()
+        };
+        break;
+      }
+    }
+    
+    if (!lastDividend) {
       res.statusCode = 404;
-      return res.end(JSON.stringify({ error: "Aucun dividende récent détecté (source: Alpha Vantage)" }));
+      return res.end(JSON.stringify({ 
+        error: "Aucun dividende récent trouvé pour ce ticker",
+        ticker: ticker
+      }));
     }
-
-    const payload = {
-      ticker,
-      source: "Alpha Vantage",
-      latestMonth: last.date,           // AAAA-MM-JJ (mois de paiement/ajustement)
-      amount: last.div,                 // montant par action sur le mois
-      currency: "USD",                  // Alpha Vantage ne renvoie pas la devise explicitement
-      fetchedAt: new Date().toISOString()
-    };
-
-    // met en cache
-    cache[ticker] = { t: now, data: payload };
-
+    
+    // Mise en cache
+    cache[ticker] = { t: now, data: lastDividend };
+    
     res.statusCode = 200;
-    return res.end(JSON.stringify(payload));
-  } catch (err) {
+    return res.end(JSON.stringify(lastDividend));
+    
+  } catch (error) {
+    console.error('Alpha Vantage API Error:', error);
     res.statusCode = 500;
-    return res.end(JSON.stringify({ error: "Erreur serveur", detail: String(err && err.message || err) }));
+    return res.end(JSON.stringify({ 
+      error: "Erreur serveur",
+      detail: String(error.message || error)
+    }));
   }
 };
+
+// Helper: Estime la payment date (~3 semaines après ex-date)
+function estimatePaymentDate(exDate) {
+  const date = new Date(exDate);
+  date.setDate(date.getDate() + 21);
+  return date.toISOString().split('T')[0];
+}
+
+// Helper: Devine la devise selon le suffixe du ticker
+function guessCurrency(ticker) {
+  const upper = ticker.toUpperCase();
+  
+  if (upper.endsWith('.CO') || upper.endsWith('.CSE')) return 'DKK'; // Copenhagen
+  if (upper.endsWith('.ST') || upper.endsWith('.STO')) return 'SEK'; // Stockholm
+  if (upper.endsWith('.OL') || upper.endsWith('.OSE')) return 'NOK'; // Oslo
+  if (upper.endsWith('.L') || upper.endsWith('.LON')) return 'GBP'; // London
+  if (upper.endsWith('.PA') || upper.endsWith('.PAR')) return 'EUR'; // Paris
+  if (upper.endsWith('.DE') || upper.endsWith('.F')) return 'EUR';   // Germany
+  if (upper.endsWith('.TO') || upper.endsWith('.TSX')) return 'CAD'; // Toronto
+  if (upper.endsWith('.AX') || upper.endsWith('.ASX')) return 'AUD'; // Australia
+  
+  return 'USD'; // Par défaut pour les actions US
+}
