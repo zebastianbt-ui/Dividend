@@ -1,69 +1,27 @@
-// api/dividende.js — Fallback vers Alpha Vantage (gratuit)
+// api/dividende.js — Alpha Vantage robuste + cache 1h (CommonJS)
 const cache = {};
 
-async function fromAlphaVantage(ticker, key) {
-  const url = `https://www.alphavantage.co/query?function=OVERVIEW&symbol=${encodeURIComponent(ticker)}&apikey=${key}`;
+async function fetchAlphaOverview(ticker, key) {
+  const url =
+    `https://www.alphavantage.co/query?function=OVERVIEW&symbol=${encodeURIComponent(ticker)}&apikey=${key}`;
   const r = await fetch(url);
-  if (!r.ok) return null;
-  const j = await r.json();
-  if (!j || !j.Symbol) return null;
-  return {
-    ticker,
-    amount: j.DividendPerShare ? Number(j.DividendPerShare) : null,
-    currency: j.Currency || null,
-    exDate: j.ExDividendDate || null,
-    paymentDate: j.DividendDate || null,
-    source: 'AlphaVantage',
-    fetchedAt: new Date().toISOString(),
-  };
-}
+  const text = await r.text(); // parfois AV renvoie du texte brut
+  let j;
+  try { j = JSON.parse(text); } catch { j = null; }
 
-module.exports = async (req, res) => {
-  res.setHeader('Content-Type', 'application/json; charset=utf-8');
-  try {
-    const raw = req.query?.ticker || '';
-    const ticker = raw.trim().toUpperCase();
-    if (!ticker) {
-      res.statusCode = 400;
-      return res.end(JSON.stringify({ error: 'Paramètre ticker manquant' }));
-    }
-
-    const now = Date.now();
-    const cached = cache[ticker];
-    if (cached && now - cached.t < 60 * 60 * 1000) {
-      res.statusCode = 200;
-      return res.end(JSON.stringify({ ...cached.d, cached: true }));
-    }
-
-    const keyAV = process.env.ALPHA_VANTAGE_KEY;
-    if (!keyAV) {
-      res.statusCode = 500;
-      return res.end(JSON.stringify({ error: 'Clé API Alpha Vantage manquante' }));
-    }
-
-    const data = await fromAlphaVantage(ticker, keyAV);
-    if (!data) {
-      res.statusCode = 404;
-      return res.end(JSON.stringify({ error: 'Aucun dividende trouvé (Alpha Vantage)' }));
-    }
-
-    cache[ticker] = { d: data, t: now };
-    res.statusCode = 200;
-    return res.end(JSON.stringify(data));
-  } catch (e) {
-    res.statusCode = 500;
-    return res.end(JSON.stringify({ error: 'Erreur serveur', detail: String(e) }));
+  if (!r.ok) {
+    return { error: `HTTP ${r.status}`, status: r.status, raw: text?.slice(0,200) };
   }
-};
-// api/dividende.js — Fallback vers Alpha Vantage (gratuit)
-const cache = {};
-
-async function fromAlphaVantage(ticker, key) {
-  const url = `https://www.alphavantage.co/query?function=OVERVIEW&symbol=${encodeURIComponent(ticker)}&apikey=${key}`;
-  const r = await fetch(url);
-  if (!r.ok) return null;
-  const j = await r.json();
-  if (!j || !j.Symbol) return null;
+  if (!j || typeof j !== 'object') {
+    return { error: 'INVALID_JSON', raw: text?.slice(0,200) };
+  }
+  if (j.Note || j.Information || j['Error Message']) {
+    // Rate-limit ou symbole invalide
+    return { error: 'PROVIDER_NOTE', note: j.Note || j.Information || j['Error Message'] };
+  }
+  if (!j.Symbol) {
+    return { error: 'NO_DATA' };
+  }
   return {
     ticker,
     amount: j.DividendPerShare ? Number(j.DividendPerShare) : null,
@@ -78,18 +36,19 @@ async function fromAlphaVantage(ticker, key) {
 module.exports = async (req, res) => {
   res.setHeader('Content-Type', 'application/json; charset=utf-8');
   try {
-    const raw = req.query?.ticker || '';
+    const raw = (req.query && req.query.ticker) ? String(req.query.ticker) : '';
     const ticker = raw.trim().toUpperCase();
     if (!ticker) {
       res.statusCode = 400;
       return res.end(JSON.stringify({ error: 'Paramètre ticker manquant' }));
     }
 
+    // Cache 1h
     const now = Date.now();
-    const cached = cache[ticker];
-    if (cached && now - cached.t < 60 * 60 * 1000) {
+    const c = cache[ticker];
+    if (c && now - c.t < 60 * 60 * 1000) {
       res.statusCode = 200;
-      return res.end(JSON.stringify({ ...cached.d, cached: true }));
+      return res.end(JSON.stringify({ ...c.d, cached: true }));
     }
 
     const keyAV = process.env.ALPHA_VANTAGE_KEY;
@@ -98,17 +57,19 @@ module.exports = async (req, res) => {
       return res.end(JSON.stringify({ error: 'Clé API Alpha Vantage manquante' }));
     }
 
-    const data = await fromAlphaVantage(ticker, keyAV);
-    if (!data) {
-      res.statusCode = 404;
-      return res.end(JSON.stringify({ error: 'Aucun dividende trouvé (Alpha Vantage)' }));
+    const out = await fetchAlphaOverview(ticker, keyAV);
+
+    if (out && !out.error) {
+      cache[ticker] = { d: out, t: now };
+      res.statusCode = 200;
+      return res.end(JSON.stringify(out));
     }
 
-    cache[ticker] = { d: data, t: now };
-    res.statusCode = 200;
-    return res.end(JSON.stringify(data));
+    // Erreur “propre” : renvoyer le détail pour debug
+    res.statusCode = 502;
+    return res.end(JSON.stringify({ error: 'Provider error', detail: out }));
   } catch (e) {
     res.statusCode = 500;
-    return res.end(JSON.stringify({ error: 'Erreur serveur', detail: String(e) }));
+    return res.end(JSON.stringify({ error: 'Exception serveur', detail: String(e) }));
   }
 };
