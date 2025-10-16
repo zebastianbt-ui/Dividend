@@ -51,7 +51,7 @@ module.exports = async (req, res) => {
       return res.end(JSON.stringify({ ...c.d, cached: true }));
     }
 
-    const keyAV = process.env.ALPHA_VANTAGE_KEY;
+    const keyAV = process.env.ALPHA_VANTAGE_KEY || process.env.AV_KEY;
     if (!keyAV) {
       res.statusCode = 500;
       return res.end(JSON.stringify({ error: 'Clé API Alpha Vantage manquante' }));
