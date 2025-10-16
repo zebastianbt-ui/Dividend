@@ -1,59 +1,57 @@
-// api/dividende.js — DIAGNOSTIC
+// api/dividende.js — Fallback vers Alpha Vantage (gratuit)
 const cache = {};
-const ymd = d => {
-  const p = n => String(n).padStart(2, '0');
-  return `${d.getFullYear()}-${p(d.getMonth()+1)}-${p(d.getDate())}`;
-};
+
+async function fromAlphaVantage(ticker, key) {
+  const url = `https://www.alphavantage.co/query?function=OVERVIEW&symbol=${encodeURIComponent(ticker)}&apikey=${key}`;
+  const r = await fetch(url);
+  if (!r.ok) return null;
+  const j = await r.json();
+  if (!j || !j.Symbol) return null;
+  return {
+    ticker,
+    amount: j.DividendPerShare ? Number(j.DividendPerShare) : null,
+    currency: j.Currency || null,
+    exDate: j.ExDividendDate || null,
+    paymentDate: j.DividendDate || null,
+    source: 'AlphaVantage',
+    fetchedAt: new Date().toISOString(),
+  };
+}
 
 module.exports = async (req, res) => {
   res.setHeader('Content-Type', 'application/json; charset=utf-8');
   try {
-    const key = process.env.FINNHUB_API_KEY;
-    const raw = (req.query && req.query.ticker) ? String(req.query.ticker) : '';
+    const raw = req.query?.ticker || '';
     const ticker = raw.trim().toUpperCase();
-    if (!ticker) { res.statusCode=400; return res.end(JSON.stringify({error:'Paramètre ticker manquant'})); }
-    if (!key)    { res.statusCode=500; return res.end(JSON.stringify({error:'Clé API Finnhub manquante'})); }
+    if (!ticker) {
+      res.statusCode = 400;
+      return res.end(JSON.stringify({ error: 'Paramètre ticker manquant' }));
+    }
 
-    // Cache 1h
     const now = Date.now();
-    const c = cache[ticker];
-    if (c && now - c.t < 60*60*1000) {
-      res.statusCode=200; return res.end(JSON.stringify({...c.d, cached:true}));
+    const cached = cache[ticker];
+    if (cached && now - cached.t < 60 * 60 * 1000) {
+      res.statusCode = 200;
+      return res.end(JSON.stringify({ ...cached.d, cached: true }));
     }
 
-    const from = '2010-01-01';
-    const to   = ymd(new Date());
-    const url  = `https://finnhub.io/api/v1/stock/dividend?symbol=${encodeURIComponent(ticker)}&from=${from}&to=${to}&token=${key}`;
+    const keyAV = process.env.ALPHA_VANTAGE_KEY;
+    if (!keyAV) {
+      res.statusCode = 500;
+      return res.end(JSON.stringify({ error: 'Clé API Alpha Vantage manquante' }));
+    }
 
-    const r = await fetch(url);
-    const status = r.status;
-    let data;
-    try { data = await r.json(); } catch { data = null; }
-
-    if (!Array.isArray(data) || data.length===0) {
+    const data = await fromAlphaVantage(ticker, keyAV);
+    if (!data) {
       res.statusCode = 404;
-      return res.end(JSON.stringify({
-        error: 'Aucun dividende trouvé',
-        debug: { ticker, status, count: Array.isArray(data)?data.length:null, sample: Array.isArray(data)&&data[0]?data[0]:null }
-      }));
+      return res.end(JSON.stringify({ error: 'Aucun dividende trouvé (Alpha Vantage)' }));
     }
 
-    data.sort((a,b)=> new Date(b.exDate||b.paymentDate||b.date||0) - new Date(a.exDate||a.paymentDate||a.date||0));
-    const d = data[0];
-    const out = {
-      ticker,
-      amount: d.amount ?? null,
-      currency: d.currency ?? null,
-      exDate: d.exDate ?? null,
-      recordDate: d.recordDate ?? null,
-      paymentDate: d.paymentDate ?? null,
-      declaredDate: d.declaredDate ?? null,
-      source: 'Finnhub',
-      fetchedAt: new Date().toISOString()
-    };
-    cache[ticker] = { d: out, t: now };
-    res.statusCode=200; return res.end(JSON.stringify(out));
+    cache[ticker] = { d: data, t: now };
+    res.statusCode = 200;
+    return res.end(JSON.stringify(data));
   } catch (e) {
-    res.statusCode=500; return res.end(JSON.stringify({error:'Exception serveur', detail:String(e)}));
+    res.statusCode = 500;
+    return res.end(JSON.stringify({ error: 'Erreur serveur', detail: String(e) }));
   }
 };
