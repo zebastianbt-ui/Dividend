@@ -1,75 +1,85 @@
-// api/dividende.js — Alpha Vantage robuste + cache 1h (CommonJS)
-const cache = {};
+// /api/dividende.js — Alpha Vantage (CommonJS) + cache 60s
 
-async function fetchAlphaOverview(ticker, key) {
-  const url =
-    `https://www.alphavantage.co/query?function=OVERVIEW&symbol=${encodeURIComponent(ticker)}&apikey=${key}`;
-  const r = await fetch(url);
-  const text = await r.text(); // parfois AV renvoie du texte brut
-  let j;
-  try { j = JSON.parse(text); } catch { j = null; }
-
-  if (!r.ok) {
-    return { error: `HTTP ${r.status}`, status: r.status, raw: text?.slice(0,200) };
-  }
-  if (!j || typeof j !== 'object') {
-    return { error: 'INVALID_JSON', raw: text?.slice(0,200) };
-  }
-  if (j.Note || j.Information || j['Error Message']) {
-    // Rate-limit ou symbole invalide
-    return { error: 'PROVIDER_NOTE', note: j.Note || j.Information || j['Error Message'] };
-  }
-  if (!j.Symbol) {
-    return { error: 'NO_DATA' };
-  }
-  return {
-    ticker,
-    amount: j.DividendPerShare ? Number(j.DividendPerShare) : null,
-    currency: j.Currency || null,
-    exDate: j.ExDividendDate || null,
-    paymentDate: j.DividendDate || null,
-    source: 'AlphaVantage',
-    fetchedAt: new Date().toISOString(),
-  };
-}
+const cache = {}; // { TICKER: { t: timestamp, data: {...} } }
 
 module.exports = async (req, res) => {
   res.setHeader('Content-Type', 'application/json; charset=utf-8');
   try {
+    const key = process.env.ALPHA_VANTAGE_KEY || '';
     const raw = (req.query && req.query.ticker) ? String(req.query.ticker) : '';
     const ticker = raw.trim().toUpperCase();
+
+    if (!key) {
+      res.statusCode = 500;
+      return res.end(JSON.stringify({ error: "Clé API Alpha Vantage manquante" }));
+    }
     if (!ticker) {
       res.statusCode = 400;
-      return res.end(JSON.stringify({ error: 'Paramètre ticker manquant' }));
+      return res.end(JSON.stringify({ error: "Paramètre ticker manquant" }));
     }
 
-    // Cache 1h
+    // Cache 60s
     const now = Date.now();
     const c = cache[ticker];
-    if (c && now - c.t < 60 * 60 * 1000) {
+    if (c && now - c.t < 60 * 1000) {
       res.statusCode = 200;
-      return res.end(JSON.stringify({ ...c.d, cached: true }));
+      return res.end(JSON.stringify({ ...c.data, cached: true }));
     }
 
-    const keyAV = process.env.ALPHA_VANTAGE_KEY || process.env.AV_KEY;
-    if (!keyAV) {
-      res.statusCode = 500;
-      return res.end(JSON.stringify({ error: 'Clé API Alpha Vantage manquante' }));
+    const url = `https://www.alphavantage.co/query?function=TIME_SERIES_MONTHLY_ADJUSTED&symbol=${encodeURIComponent(ticker)}&datatype=json&apikey=${key}`;
+    const r = await fetch(url);
+    const status = r.status;
+    let j = null;
+    try { j = await r.json(); } catch { j = null; }
+
+    // Messages d’erreur Alpha Vantage (rate limit, bad key, etc.)
+    if (!j || typeof j !== 'object') {
+      res.statusCode = 502;
+      return res.end(JSON.stringify({ error: "Réponse API invalide", status }));
+    }
+    if (j.Note) {
+      // Rate limit atteint
+      res.statusCode = 429;
+      return res.end(JSON.stringify({ error: "Limite Alpha Vantage atteinte. Réessaie dans une minute.", note: j.Note }));
+    }
+    if (j['Error Message']) {
+      res.statusCode = 400;
+      return res.end(JSON.stringify({ error: "Symbole invalide ou non pris en charge", detail: j['Error Message'] }));
     }
 
-    const out = await fetchAlphaOverview(ticker, keyAV);
-
-    if (out && !out.error) {
-      cache[ticker] = { d: out, t: now };
-      res.statusCode = 200;
-      return res.end(JSON.stringify(out));
+    const series = j['Monthly Adjusted Time Series'];
+    if (!series || typeof series !== 'object') {
+      res.statusCode = 404;
+      return res.end(JSON.stringify({ error: "Aucune donnée mensuelle trouvée pour ce ticker" }));
     }
 
-    // Erreur “propre” : renvoyer le détail pour debug
-    res.statusCode = 502;
-    return res.end(JSON.stringify({ error: 'Provider error', detail: out }));
-  } catch (e) {
+    // Cherche le dernier mois où '7. dividend amount' > 0
+    const entries = Object.entries(series)
+      .map(([date, values]) => ({ date, div: parseFloat(values['7. dividend amount'] || '0') }))
+      .sort((a, b) => (a.date < b.date ? 1 : -1)); // plus récent d’abord
+
+    const last = entries.find(e => e.div > 0);
+    if (!last) {
+      res.statusCode = 404;
+      return res.end(JSON.stringify({ error: "Aucun dividende récent détecté (source: Alpha Vantage)" }));
+    }
+
+    const payload = {
+      ticker,
+      source: "Alpha Vantage",
+      latestMonth: last.date,           // AAAA-MM-JJ (mois de paiement/ajustement)
+      amount: last.div,                 // montant par action sur le mois
+      currency: "USD",                  // Alpha Vantage ne renvoie pas la devise explicitement
+      fetchedAt: new Date().toISOString()
+    };
+
+    // met en cache
+    cache[ticker] = { t: now, data: payload };
+
+    res.statusCode = 200;
+    return res.end(JSON.stringify(payload));
+  } catch (err) {
     res.statusCode = 500;
-    return res.end(JSON.stringify({ error: 'Exception serveur', detail: String(e) }));
+    return res.end(JSON.stringify({ error: "Erreur serveur", detail: String(err && err.message || err) }));
   }
 };
